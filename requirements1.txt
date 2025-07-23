@@ -1,0 +1,5 @@
+streamlit
+pandas
+psycopg2-binary
+
+git remote add origin https://github.com/dhivyadharani-dede/nifty-orb-backtest.git
