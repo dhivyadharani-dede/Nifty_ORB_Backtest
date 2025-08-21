@@ -1,0 +1,4 @@
+psql -U postgres -d Nifty_ORB_Backtest
+
+\copy "Nifty50" FROM 'C:\\Users\\DIVYA\\NIFTY 50_04012025_07102025.csv' DELIMITER ',' CSV HEADER;
+\copy "Nifty_options" FROM 'C:\\Users\\DIVYA\\nifty_options_combined.csv' DELIMITER ',' CSV HEADER;

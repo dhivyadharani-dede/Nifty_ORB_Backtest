@@ -1,0 +1,13 @@
+cd nifty-strategy-ui
+python -m venv venv
+venv\Scripts\activate
+
+pip install streamlit psycopg2-binary pandas
+pip install sqlalchemy
+
+streamlit run strategy_ui_updated_new.py
+
+
+SELECT * FROM pg_matviews WHERE matviewname = 'mv_all_5min_breakouts';
+
+SELECT pg_get_viewdef('mv_all_5min_breakouts', true);
