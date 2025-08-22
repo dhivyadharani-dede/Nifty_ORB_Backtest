@@ -1093,7 +1093,7 @@ WHERE rn = 1;
 
 CREATE MATERIALIZED VIEW mv_reentry_base_strike_selection AS
 WITH strategy AS (
-    SELECT * FROM strategy_settings WHERE strategy_name = 'default'
+    SELECT * FROM strategy_settings 
 ),
 reentry_info AS (
     SELECT 
@@ -1437,28 +1437,40 @@ sl_triggered AS (
     ORDER BY trade_date, expiry_date, option_type, strike, entry_round, ltp_time
 ),
 sl_leg_counts AS (
-    SELECT 
+    
+   SELECT 
         l.trade_date,
         l.expiry_date,
         l.entry_round,
+		lp.ltp_time,
         COUNT(*) FILTER (WHERE l.leg_type = 'RE-ENTRY') AS total_entry_legs,
-        COUNT(*) FILTER (WHERE sl.leg_type = 'RE-ENTRY' AND sl.exit_reason = 'SL Hit') AS sl_hit_legs,
-        SUM(lp.option_open) FILTER (WHERE l.leg_type = 'RE-ENTRY') AS total_entry_ltp,
-        MAX(lp.option_open) FILTER (WHERE l.leg_type = 'HEDGE-REENTRY') AS hedge_ltp
+        COUNT(*) FILTER (WHERE sl.leg_type = 'RE-ENTRY' AND sl.exit_reason = 'SL Hit'
+		AND sl.exit_time <= lp.ltp_time) AS sl_hit_legs,
+		SUM(lp.option_open) FILTER (
+        WHERE l.leg_type = 'RE-ENTRY' AND lp.ltp_time IS NOT NULL
+  		  ) AS total_entry_ltp,
+		MAX(lp.option_open) FILTER (
+        WHERE l.leg_type = 'HEDGE-REENTRY' AND lp.ltp_time IS NOT NULL
+    	) AS hedge_ltp
+        
     FROM legs l 
-    LEFT JOIN sl_triggered sl 
+     LEFT JOIN sl_triggered sl 
         ON sl.trade_date = l.trade_date 
         AND sl.expiry_date = l.expiry_date
         AND sl.option_type = l.option_type 
         AND sl.strike = l.strike 
         AND l.entry_round = sl.entry_round
-    LEFT JOIN live_prices lp 
+      LEFT JOIN live_prices lp 
         ON lp.trade_date = l.trade_date 
         AND lp.expiry_date = l.expiry_date
         AND lp.option_type = l.option_type 
         AND lp.strike = l.strike 
         AND lp.entry_round = l.entry_round
-    GROUP BY l.trade_date, l.expiry_date, l.entry_round
+	-- WHERE l.trade_date='2025-06-19'
+    GROUP BY l.trade_date, l.expiry_date, l.entry_round,lp.ltp_time
+		-- ,lp.option_open,l.leg_type,lp.ltp_time
+	ORDER BY lp.ltp_time
+
 ),
 hedge_exit_on_ALL_SL AS (
     SELECT 
@@ -1549,18 +1561,45 @@ SELECT DISTINCT ON (h.trade_date, h.expiry_date, h.option_type, h.strike)
      AND o.strike = h.strike
      AND o.time::TIME = sc.eod_time::TIME
     -- WHERE h.leg_type = 'REHEDGE'
+),open_leg_prices AS (
+    SELECT 
+        l.trade_date,
+        l.expiry_date,
+        l.entry_round,
+        l.option_type,
+        l.strike,
+        l.leg_type,
+        lp.ltp_time,
+        lp.option_open
+        -- l.exit_reason
+    FROM legs l
+    JOIN live_prices lp 
+      ON lp.trade_date = l.trade_date
+     AND lp.expiry_date = l.expiry_date
+     AND lp.entry_round = l.entry_round
+     AND lp.option_type = l.option_type
+     AND lp.strike = l.strike
+    WHERE NOT EXISTS (
+          SELECT 1 
+          FROM sl_triggered hex
+          WHERE hex.trade_date = l.trade_date
+            AND hex.option_type = l.option_type
+            AND hex.strike = l.strike
+			aND hex.entry_round=l.entry_round
+			AND hex.leg_type=l.leg_type ) -- 🔍 Only consider open legs
 ),
 hedge_exit_50pct_NOSL AS (
- SELECT DISTINCT ON (h.trade_date, h.expiry_date, h.option_type, h.strike,h.entry_round) 
-    sl.trade_date,
-    sl.expiry_date,
+   SELECT DISTINCT ON (h.trade_date, h.expiry_date, h.option_type, h.strike,h.entry_round)
+    h.trade_date,
+    h.expiry_date,
     h.breakout_time,
     h.entry_time,
     h.spot_price,
     h.option_type::char,
     h.strike,
     h.entry_price,
-    sc.hedge_exit_entry_ratio * sl.total_entry_ltp AS sl_level,
+    sc.hedge_exit_entry_ratio * entry_ltp AS sl_level,
+	entry_ltp,h.hedge_ltp,
     h.entry_round,
     h.leg_type,
     'SELL'::TEXT AS transaction_type,
@@ -1569,20 +1608,43 @@ hedge_exit_50pct_NOSL AS (
     'EXIT - 50% ENTRY < HEDGE' AS exit_status,
     ROUND((h.entry_price - h.option_open) * sc.no_of_lots * sc.lot_size, 2) AS pnl_amount,
     ROW_NUMBER() OVER (
-        PARTITION BY sl.trade_date, sl.expiry_date, h.option_type, h.strike, h.entry_round 
+        PARTITION BY h.trade_date, h.expiry_date, h.option_type, h.strike, h.entry_round 
         ORDER BY h.ltp_time
     ) AS rn
-FROM live_prices h
-JOIN sl_leg_counts sl
+ FROM (
+      SELECT 
+          h.*,
+          SUM(olp.option_open) FILTER (WHERE olp.leg_type = 'RE-ENTRY') 
+              OVER (PARTITION BY h.trade_date, h.expiry_date, h.entry_round, h.ltp_time) AS entry_ltp,
+          MAX(olp.option_open) FILTER (WHERE olp.leg_type = 'HEDGE-REENTRY') 
+              OVER (PARTITION BY h.trade_date, h.expiry_date, h.entry_round, h.ltp_time) AS hedge_ltp
+      FROM live_prices h
+      JOIN open_leg_prices olp 
+        ON olp.trade_date = h.trade_date
+       AND olp.expiry_date = h.expiry_date
+       AND olp.entry_round = h.entry_round
+       AND olp.ltp_time = h.ltp_time
+  ) h
+  JOIN sl_leg_counts sl
     ON sl.trade_date = h.trade_date 
    AND sl.expiry_date = h.expiry_date 
    AND sl.entry_round = h.entry_round
-CROSS JOIN strategy sc
-WHERE sl.sl_hit_legs = 0
-  AND sl.total_entry_ltp IS NOT NULL
-  AND sl.hedge_ltp IS NOT NULL
-  AND sl.hedge_ltp > sc.hedge_exit_entry_ratio * sl.total_entry_ltp
-  ),
+  CROSS JOIN strategy sc
+  WHERE --h.total_entry_ltp IS NOT NULL     AND 
+  sl.sl_hit_legs = 0 AND
+  h.hedge_ltp IS NOT NULL
+    AND h.hedge_ltp > sc.hedge_exit_entry_ratio * entry_ltp
+	AND NOT EXISTS (
+          SELECT 1 
+          FROM sl_triggered hex
+          WHERE hex.trade_date = h.trade_date
+            AND hex.option_type = h.option_type
+            AND hex.strike = h.strike
+			aND hex.entry_round=h.entry_round
+			AND hex.leg_type=h.leg_type )
+			
+)
+,
 hedge_exit_3x_Min_one_SL AS (
   SELECT DISTINCT ON (h.trade_date, h.expiry_date, h.option_type, h.strike,h.entry_round)
     sl.trade_date,
@@ -1593,28 +1655,48 @@ hedge_exit_3x_Min_one_SL AS (
     h.option_type::char,
     h.strike,
     h.entry_price,
-    sc.hedge_exit_multiplier * sl.total_entry_ltp AS sl_level,
+    sc.hedge_exit_multiplier * entry_ltp AS sl_level,
     h.entry_round,
     h.leg_type,
     'SELL'::TEXT AS transaction_type,
     h.ltp_time::TIME AS exit_time,
     h.option_open AS sl_hit_price,
-    'EXIT - 50% ENTRY < HEDGE' AS exit_status,
+    'EXIT - 3X' AS exit_status,
     ROUND((h.entry_price - h.option_open) * sc.no_of_lots * sc.lot_size, 2) AS pnl_amount,
     ROW_NUMBER() OVER (
-        PARTITION BY sl.trade_date, sl.expiry_date, h.option_type, h.strike, h.entry_round 
+        PARTITION BY h.trade_date, h.expiry_date, h.option_type, h.strike, h.entry_round 
         ORDER BY h.ltp_time
     ) AS rn
-FROM live_prices h
-JOIN sl_leg_counts sl
+  FROM (
+      SELECT 
+          h.*,
+          SUM(olp.option_open) FILTER (WHERE olp.leg_type = 'RE-ENTRY') 
+              OVER (PARTITION BY h.trade_date, h.expiry_date, h.entry_round, h.ltp_time) AS entry_ltp,
+          MAX(olp.option_open) FILTER (WHERE olp.leg_type = 'HEDGE-REENTRY') 
+              OVER (PARTITION BY h.trade_date, h.expiry_date, h.entry_round, h.ltp_time) AS hedge_ltp
+      FROM live_prices h
+      JOIN open_leg_prices olp 
+        ON olp.trade_date = h.trade_date
+       AND olp.expiry_date = h.expiry_date
+       AND olp.entry_round = h.entry_round
+       AND olp.ltp_time = h.ltp_time
+  ) h
+  JOIN sl_leg_counts sl
     ON sl.trade_date = h.trade_date 
    AND sl.expiry_date = h.expiry_date 
    AND sl.entry_round = h.entry_round
-CROSS JOIN strategy sc
-WHERE sl.sl_hit_legs >1 AND sl.sl_hit_legs!=sl.total_entry_legs
-  AND sl.total_entry_ltp IS NOT NULL
-  AND sl.hedge_ltp IS NOT NULL
-  AND sl.hedge_ltp > sc.hedge_exit_multiplier * sl.total_entry_ltp),
+  CROSS JOIN strategy sc
+  WHERE sl.sl_hit_legs > 1
+    AND sl.sl_hit_legs != sl.total_entry_legs
+    AND h.hedge_ltp > sc.hedge_exit_multiplier * h.entry_ltp
+	AND NOT EXISTS (
+          SELECT 1 
+          FROM sl_triggered hex
+          WHERE hex.trade_date = h.trade_date
+            AND hex.option_type = h.option_type
+            AND hex.strike = h.strike
+			aND hex.entry_round=h.entry_round
+			AND hex.leg_type=h.leg_type )),
 closed_legs AS (
   SELECT * FROM sl_triggered
   UNION ALL 
