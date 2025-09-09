@@ -1,4 +1,27 @@
 psql -U postgres -d Nifty_ORB_Backtest
-
+\c Nifty_ORB_Backtest
 \copy "Nifty50" FROM 'C:\\Users\\DIVYA\\NIFTY 50_04012025_07102025.csv' DELIMITER ',' CSV HEADER;
 \copy "Nifty_options" FROM 'C:\\Users\\DIVYA\\nifty_options_combined.csv' DELIMITER ',' CSV HEADER;
+
+\copy "Nifty50" FROM 'C:\\Users\\DIVYA\Desktop\\Python_Queries\\nifty_50_combined.csv' DELIMITER ',' CSV HEADER;
+\copy "Nifty_options" FROM 'C:\\Users\\DIVYA\Desktop\\Python_Queries\\\nifty_options_Aug28_combined.csv' DELIMITER ',' CSV HEADER;
+
+
+SELECT date, time, open, high, low, close, volume, oi, option_nm, COUNT(*)
+FROM public."Nifty50" 
+GROUP BY date, time, open, high, low, close, volume, oi, option_nm
+HAVING COUNT(*) > 1;
+
+WITH duplicates AS (
+  SELECT ctid,
+         ROW_NUMBER() OVER (
+           PARTITION BY date, time, open, high, low, close, volume, oi, option_nm
+           ORDER BY ctid
+         ) AS rn
+  FROM public."Nifty50"
+)
+DELETE FROM public."Nifty50"
+WHERE ctid IN (
+  SELECT ctid FROM duplicates WHERE rn > 1
+);
+
